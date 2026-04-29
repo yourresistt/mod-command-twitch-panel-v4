@@ -4,9 +4,12 @@ import { z } from "zod";
 import { storage, sqliteDb } from "./storage";
 import { commandUpdateSchema, moderationActionSchema } from "@shared/schema";
 import { TWITCH_SCOPES, TwitchClient, TwitchTokenStore } from "./twitch";
+import { EventSubManager, LiveQueueStore } from "./eventsub";
 
 const tokenStore = new TwitchTokenStore(sqliteDb);
 const twitch = new TwitchClient(tokenStore);
+const liveQueue = new LiveQueueStore(sqliteDb);
+const eventSub = new EventSubManager(twitch, tokenStore, liveQueue);
 
 const demoMessages = [
   {
@@ -62,16 +65,19 @@ const channelInputSchema = z.object({
 function statusPayload() {
   const record = tokenStore.get();
   const connected = Boolean(record?.accessToken && record?.userId);
+  const liveItems = liveQueue.list();
+  const eventSubState = eventSub.getStatus();
   return {
     channel: record?.broadcasterLogin ?? "demo_channel",
     mode: connected ? (record?.broadcasterId ? "live" : "live-needs-channel") : "demo",
     connected,
     viewers: 847,
     chatters: 219,
-    pending: demoMessages.length,
+    pending: liveItems.length + demoMessages.length,
+    livePending: liveItems.length,
     actionsToday: 38,
     automod: "guarded",
-    eventSub: connected ? "ready-for-eventsub" : process.env.TWITCH_CLIENT_ID ? "credentials-present" : "needs-credentials",
+    eventSub: eventSubState.status,
     hasTwitchCredentials: twitch.hasCredentials,
     oauthUrl: twitch.authorizeUrl(),
     requiredEnv: ["TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "TWITCH_REDIRECT_URI"],
@@ -147,7 +153,9 @@ export async function registerRoutes(
   });
 
   app.get("/api/moderation/queue", async (_req, res) => {
-    res.json(demoMessages);
+    const live = liveQueue.list();
+    const demo = demoMessages.map((m) => ({ ...m, source: "demo" as const, messageId: null }));
+    res.json([...live, ...demo]);
   });
 
   app.get("/api/moderation/events", async (_req, res) => {
@@ -215,6 +223,7 @@ export async function registerRoutes(
             });
             if (result.ok) {
               twitchSummary = `Message ${parsed.data.messageId} deleted.`;
+              liveQueue.remove(parsed.data.messageId);
             } else {
               outcome = "error";
               twitchError = `Helix /moderation/chat returned ${result.status}: ${result.raw}`;
@@ -354,6 +363,8 @@ export async function registerRoutes(
   });
 
   app.post("/api/twitch/disconnect", async (_req, res) => {
+    eventSub.stop();
+    liveQueue.clear();
     tokenStore.clear();
     res.json({ ok: true });
   });
@@ -372,11 +383,17 @@ export async function registerRoutes(
       if (!user) {
         return res.status(404).json({ message: `Channel "${parsed.data.channelLogin}" not found.` });
       }
+      const previous = tokenStore.get();
       const updated = tokenStore.setBroadcaster({
         id: user.id,
         login: user.login,
         displayName: user.display_name,
       });
+      // If broadcaster changed, stop any running EventSub and clear stale queue.
+      if (previous?.broadcasterId && previous.broadcasterId !== user.id) {
+        eventSub.stop();
+        liveQueue.clear();
+      }
       res.json({
         ok: true,
         broadcaster: {
@@ -445,6 +462,35 @@ export async function registerRoutes(
       );
     }
   });
+
+  app.get("/api/twitch/eventsub/status", async (_req, res) => {
+    res.json(eventSub.getStatus());
+  });
+
+  app.post("/api/twitch/eventsub/start", async (_req, res) => {
+    const result = await eventSub.start();
+    if (!result.ok) {
+      return res.status(result.status).json({ ok: false, message: result.message });
+    }
+    res.json({ ok: true, status: eventSub.getStatus() });
+  });
+
+  app.post("/api/twitch/eventsub/stop", async (_req, res) => {
+    eventSub.stop();
+    res.json({ ok: true, status: eventSub.getStatus() });
+  });
+
+  // Best-effort auto-start when token + broadcaster are already configured at boot.
+  setTimeout(() => {
+    const record = tokenStore.get();
+    if (record?.userId && record?.broadcasterId) {
+      eventSub.start().then((result) => {
+        if (!result.ok) {
+          console.warn(`[eventsub] auto-start skipped: ${result.message}`);
+        }
+      });
+    }
+  }, 500);
 
   return httpServer;
 }

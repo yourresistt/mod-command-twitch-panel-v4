@@ -64,6 +64,26 @@ type QueueItem = {
   seenBefore: string;
   accountAge: string;
   badges: string[];
+  source?: "live" | "demo";
+  messageId?: string | null;
+  receivedAt?: number;
+};
+
+type EventSubStatus = {
+  running: boolean;
+  status: "idle" | "connecting" | "connected" | "subscribed" | "reconnecting" | "stopped" | "error";
+  sessionId: string | null;
+  subscriptionId: string | null;
+  lastEventAt: number | null;
+  lastKeepaliveAt: number | null;
+  lastError: string | null;
+  startedAt: number | null;
+  reconnectAttempts: number;
+  keepaliveTimeoutSeconds: number | null;
+  hasCredentials: boolean;
+  moderator: { id: string | null; login: string | null; displayName: string | null } | null;
+  broadcaster: { id: string | null; login: string | null; displayName: string | null } | null;
+  readyToStart: boolean;
 };
 
 type ModerationEvent = {
@@ -397,13 +417,27 @@ function QueueView({
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_19rem]">
       <div className="space-y-3">
-        {queue.map((item) => (
+        {queue.map((item) => {
+          const isLive = item.source === "live";
+          return (
           <article key={item.id} className="rounded-xl border border-card-border bg-card p-4 shadow-sm" data-testid={`card-queue-${item.id}`}>
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="text-base font-semibold">{item.user}</h2>
                   <RiskBadge level={item.level} risk={item.risk} />
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      "gap-1.5",
+                      isLive
+                        ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
+                        : "border-slate-400/30 bg-slate-500/10 text-slate-300",
+                    )}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                    {isLive ? "Live" : "Demo"}
+                  </Badge>
                   {item.badges.map((badge) => (
                     <Badge key={badge} variant="outline" className="border-border/80 text-muted-foreground">
                       {badge}
@@ -411,7 +445,17 @@ function QueueView({
                   ))}
                 </div>
                 <p className="mt-3 rounded-lg border border-border/70 bg-background/60 p-3 text-sm text-foreground">{item.message}</p>
-                <p className="mt-2 text-xs text-muted-foreground">{item.reason} · {item.seenBefore} · account {item.accountAge}</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {item.reason}
+                  {item.seenBefore ? ` · ${item.seenBefore}` : ""}
+                  {item.accountAge ? ` · account ${item.accountAge}` : ""}
+                  {isLive && item.messageId ? (
+                    <>
+                      {" · "}
+                      <span className="font-mono text-[10px] opacity-70">id {item.messageId.slice(0, 8)}…</span>
+                    </>
+                  ) : null}
+                </p>
               </div>
               <Button variant="outline" size="sm" onClick={() => onSelect(item)} data-testid={`button-details-${item.id}`}>
                 Details
@@ -426,7 +470,14 @@ function QueueView({
                 <Clock3 className="h-4 w-4" />
                 10m
               </Button>
-              <Button size="sm" variant="outline" onClick={() => onAction(item, "delete")} data-testid={`button-delete-${item.id}`}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onAction(item, "delete")}
+                disabled={!isLive}
+                title={isLive ? "Delete via Helix" : "Delete needs a live EventSub message id"}
+                data-testid={`button-delete-${item.id}`}
+              >
                 <Trash2 className="h-4 w-4" />
                 Delete
               </Button>
@@ -436,7 +487,8 @@ function QueueView({
               </Button>
             </div>
           </article>
-        ))}
+          );
+        })}
       </div>
       <aside className="rounded-xl border border-card-border bg-card p-4">
         <h2 className="text-sm font-semibold">Mod decision pattern</h2>
@@ -579,13 +631,54 @@ function ChecklistRow({ ok, label, hint }: { ok: boolean; label: string; hint?: 
   );
 }
 
-function ConnectView({ status, twitch }: { status?: Status; twitch?: TwitchStatus }) {
+function ConnectView({
+  status,
+  twitch,
+  eventSub,
+}: {
+  status?: Status;
+  twitch?: TwitchStatus;
+  eventSub?: EventSubStatus;
+}) {
   const { toast } = useToast();
   const [channelInput, setChannelInput] = useState("");
 
   useEffect(() => {
     if (twitch?.broadcaster?.login) setChannelInput(twitch.broadcaster.login);
   }, [twitch?.broadcaster?.login]);
+
+  const startMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch("/api/twitch/eventsub/start", { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      return { ok: response.ok, status: response.status, body } as const;
+    },
+    onSuccess: ({ ok, body }) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/twitch/eventsub/status"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/status"] });
+      if (ok) {
+        toast({ title: "EventSub starting", description: "Subscribing to channel.chat.message…" });
+      } else {
+        toast({
+          title: "Could not start EventSub",
+          description: (body as any)?.message ?? "Unknown error",
+          variant: "destructive",
+        });
+      }
+    },
+  });
+
+  const stopMutation = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/twitch/eventsub/stop");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/twitch/eventsub/status"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/status"] });
+      toast({ title: "EventSub stopped" });
+    },
+  });
 
   const channelMutation = useMutation({
     mutationFn: async (channelLogin: string) => {
@@ -625,6 +718,20 @@ function ConnectView({ status, twitch }: { status?: Status; twitch?: TwitchStatu
   const oauthUrl = twitch?.oauthUrl ?? status?.oauthUrl ?? null;
   const scopes = twitch?.scopes ?? status?.scopes ?? [];
   const redirectUri = twitch?.redirectUri ?? status?.redirectUri ?? "";
+
+  const evStatus = eventSub?.status ?? "idle";
+  const evRunning = Boolean(eventSub?.running);
+  const evReadyToStart = Boolean(eventSub?.readyToStart);
+  const lastEvent = eventSub?.lastEventAt ? new Date(eventSub.lastEventAt) : null;
+  const lastError = eventSub?.lastError ?? null;
+  const evBadgeStyle =
+    evStatus === "subscribed"
+      ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
+      : evStatus === "error"
+        ? "border-red-400/30 bg-red-500/10 text-red-200"
+        : evStatus === "stopped" || evStatus === "idle"
+          ? "border-slate-400/30 bg-slate-500/10 text-slate-300"
+          : "border-amber-400/30 bg-amber-500/10 text-amber-100";
 
   return (
     <div className="grid gap-5 xl:grid-cols-[1fr_24rem]">
@@ -770,7 +877,81 @@ function ConnectView({ status, twitch }: { status?: Status; twitch?: TwitchStatu
             <p><span className="text-foreground">user:read/write:chat</span> — bot-style command responses.</p>
           </div>
           <p className="text-xs">
-            Delete needs a real Twitch <code>message_id</code> from EventSub or live chat. The demo queue uses placeholder ids and will return a clear error until EventSub ingestion lands.
+            Delete needs a real Twitch <code>message_id</code> from EventSub or live chat. The demo queue uses placeholder ids and will return a clear error until EventSub starts.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card className="border-card-border bg-card xl:col-span-2">
+        <CardHeader className="flex flex-row items-center justify-between gap-3">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Radio className="h-4 w-4 text-primary" />
+              Live queue · EventSub WebSocket
+            </CardTitle>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Streams live <code>channel.chat.message</code> events from Twitch. Suspicious messages land in the queue with a real <code>message_id</code> so delete works.
+            </p>
+          </div>
+          <Badge variant="outline" className={cn("gap-1.5 capitalize", evBadgeStyle)} data-testid="badge-eventsub-status">
+            <span className="h-1.5 w-1.5 rounded-full bg-current" />
+            {evStatus}
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-lg border border-border bg-background/50 p-3">
+              <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Session</p>
+              <p className="mt-1 break-all font-mono text-xs text-foreground" data-testid="text-eventsub-session">
+                {eventSub?.sessionId ?? "—"}
+              </p>
+            </div>
+            <div className="rounded-lg border border-border bg-background/50 p-3">
+              <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Subscription</p>
+              <p className="mt-1 break-all font-mono text-xs text-foreground">
+                {eventSub?.subscriptionId ?? "—"}
+              </p>
+            </div>
+            <div className="rounded-lg border border-border bg-background/50 p-3">
+              <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Last event</p>
+              <p className="mt-1 text-xs text-foreground" data-testid="text-eventsub-last-event">
+                {lastEvent ? lastEvent.toLocaleTimeString() : "—"}
+              </p>
+            </div>
+          </div>
+
+          {lastError ? (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200" data-testid="text-eventsub-error">
+              {lastError}
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              onClick={() => startMutation.mutate()}
+              disabled={!evReadyToStart || evRunning || startMutation.isPending}
+              data-testid="button-eventsub-start"
+            >
+              <Sparkles className="h-4 w-4" />
+              {evRunning ? "Live queue running" : "Start live queue"}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => stopMutation.mutate()}
+              disabled={!evRunning || stopMutation.isPending}
+              data-testid="button-eventsub-stop"
+            >
+              Stop
+            </Button>
+            {!evReadyToStart ? (
+              <p className="text-xs text-muted-foreground">
+                Authorize Twitch and configure a broadcaster channel above first.
+              </p>
+            ) : null}
+          </div>
+
+          <p className="text-xs text-muted-foreground">
+            Render free-tier services may sleep when idle, which closes the WebSocket. The live queue resumes after the service wakes; click Start again if needed.
           </p>
         </CardContent>
       </Card>
@@ -828,7 +1009,13 @@ function UserDrawer({
                     <Clock3 className="h-4 w-4" />
                     Timeout 10m
                   </Button>
-                  <Button variant="outline" onClick={() => onAction(selected, "delete")} data-testid="drawer-delete">
+                  <Button
+                    variant="outline"
+                    onClick={() => onAction(selected, "delete")}
+                    disabled={selected.source !== "live"}
+                    title={selected.source === "live" ? "Delete via Helix" : "Delete needs a live EventSub message id"}
+                    data-testid="drawer-delete"
+                  >
                     <Trash2 className="h-4 w-4" />
                     Delete message
                   </Button>
@@ -854,7 +1041,8 @@ function Dashboard() {
 
   const { data: status } = useQuery<Status>({ queryKey: ["/api/status"], refetchInterval: 8000 });
   const { data: twitchStatus } = useQuery<TwitchStatus>({ queryKey: ["/api/twitch/status"], refetchInterval: 12000 });
-  const { data: queueData = [] } = useQuery<QueueItem[]>({ queryKey: ["/api/moderation/queue"], refetchInterval: 6000 });
+  const { data: eventSubStatus } = useQuery<EventSubStatus>({ queryKey: ["/api/twitch/eventsub/status"], refetchInterval: 4000 });
+  const { data: queueData = [] } = useQuery<QueueItem[]>({ queryKey: ["/api/moderation/queue"], refetchInterval: 4000 });
   const { data: events = [] } = useQuery<ModerationEvent[]>({ queryKey: ["/api/moderation/events"] });
   const { data: commands = [] } = useQuery<ChatCommand[]>({ queryKey: ["/api/commands"] });
 
@@ -869,7 +1057,7 @@ function Dashboard() {
           targetUser: item.user,
           action,
           reason: item.reason,
-          messageId: item.id,
+          messageId: item.messageId ?? item.id,
         }),
       });
       const body = await response.json().catch(() => ({}));
@@ -930,7 +1118,9 @@ function Dashboard() {
             {active === "queue" ? <QueueView queue={queue} onSelect={setSelected} onAction={onAction} /> : null}
             {active === "commands" ? <CommandsView commands={commands} /> : null}
             {active === "history" ? <HistoryView events={events} /> : null}
-            {active === "connect" ? <ConnectView status={status} twitch={twitchStatus} /> : null}
+            {active === "connect" ? (
+              <ConnectView status={status} twitch={twitchStatus} eventSub={eventSubStatus} />
+            ) : null}
           </main>
         </div>
         <UserDrawer selected={selected} setSelected={setSelected} onAction={onAction} />
